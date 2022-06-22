@@ -15,7 +15,10 @@ use std::process;
 use std::process::Command;
 use std::str;
 use std::{thread, time};
-use sysinfo::{Pid, Process, ProcessExt, RefreshKind, SystemExt};
+use sysinfo::{
+    Pid, Process, ProcessExt, ProcessRefreshKind, ProcessStatus, RefreshKind, System, SystemExt,
+    Uid, UserExt,
+};
 
 #[derive(Debug)]
 struct SystemState {
@@ -24,29 +27,74 @@ struct SystemState {
     used_memory: u64,
     total_swap: u64,
     used_swap: u64,
-    processes: HashMap<Pid, Process>,
+    processes: HashMap<Pid, ProcessData>,
 }
 
 impl SystemState {
     fn new(maybe_system: Option<&sysinfo::System>) -> SystemState {
         fn new_state(system: &sysinfo::System) -> SystemState {
+            let processes = system
+                .processes()
+                .iter()
+                .map(|(pid, process)| (pid.to_owned(), ProcessData::from(process)))
+                .collect();
             SystemState {
                 timestamp: Utc::now(),
-                total_memory: system.get_total_memory(),
-                used_memory: system.get_used_memory(),
-                total_swap: system.get_total_swap(),
-                used_swap: system.get_used_swap(),
-                processes: system.get_process_list().to_owned(),
+                total_memory: system.total_memory(),
+                used_memory: system.used_memory(),
+                total_swap: system.total_swap(),
+                used_swap: system.used_swap(),
+                processes,
             }
         }
         match maybe_system {
             None => {
                 let system = sysinfo::System::new_with_specifics(
-                    RefreshKind::new().with_system().with_processes(),
+                    RefreshKind::new()
+                        .with_processes(ProcessRefreshKind::new())
+                        .with_memory()
+                        .with_disks(),
                 );
                 new_state(&system)
             }
             Some(system) => new_state(system),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProcessData {
+    cmd: Vec<String>,
+    cpu_usage: f32,
+    cwd: String,
+    environ: Vec<String>,
+    exe: String,
+    memory: u64,
+    name: String,
+    parent: Option<Pid>,
+    pid: Pid,
+    root: String,
+    start_time: u64,
+    status: ProcessStatus,
+    user_id: Option<Uid>,
+}
+
+impl ProcessData {
+    fn from(process: &Process) -> ProcessData {
+        ProcessData {
+            cmd: process.cmd().to_owned(),
+            cpu_usage: process.cpu_usage(),
+            cwd: process.cwd().to_string_lossy().to_string(),
+            environ: process.environ().to_vec(),
+            exe: process.exe().to_string_lossy().to_string(),
+            memory: process.memory(),
+            name: process.name().to_owned(),
+            parent: process.parent(),
+            pid: process.pid(),
+            root: process.root().to_string_lossy().to_string(),
+            start_time: process.start_time(),
+            status: process.status(),
+            user_id: process.user_id().map(|uid| uid.to_owned()),
         }
     }
 }
@@ -151,8 +199,9 @@ fn handle_ooms(oom_data: OomData, system: &sysinfo::System) -> OomData {
                             process::exit(1);
                         }
                         Ok(killed_process_id) => {
+                            let killed_process_id = Pid::from(killed_process_id);
                             let maybe_last_snapshot =
-                                get_snapshot_with_killed_process(&snapshots, killed_process_id);
+                                get_snapshot_with_killed_process(&snapshots, &killed_process_id);
                             match maybe_last_snapshot {
                                 None => match snapshots.front() {
                                     None => error!(
@@ -160,7 +209,7 @@ fn handle_ooms(oom_data: OomData, system: &sysinfo::System) -> OomData {
                                     ),
                                     Some(snapshot) => {
                                         error!("No snapshot with killed process in queue. For debugging purposes, we'll print out the last snapshot");
-                                        print_processes_by_memory(snapshot)
+                                        print_processes_by_memory(system, snapshot)
                                     }
                                 },
                                 Some(snapshot) => {
@@ -186,7 +235,7 @@ fn handle_ooms(oom_data: OomData, system: &sysinfo::System) -> OomData {
                                             None => error!("get_snapshot_with_killed_process malfunctioned. Should never happen"),
                                             Some(killed_process) => info!("The following process was killed: {}", process_to_long_string(killed_process, snapshot))
                                         }
-                                    print_processes_by_memory(snapshot)
+                                    print_processes_by_memory(system, snapshot)
                                 }
                             }
                             info!("\n#\n#\n#\n#\n#\n#\n#\n#\n#\n#\n#\n#");
@@ -215,7 +264,7 @@ fn handle_max_mem_statistics(max_mem_data: MaxMemData, system: &sysinfo::System)
         && ((next_midnight - now).num_seconds().abs() < 10
             || (previous_midnight - now).num_seconds().abs() < 10)
     {
-        let system_total_memory = system.get_total_memory();
+        let system_total_memory = system.total_memory();
         info!(
             "Max seen memory usage throughout the day: {}kB. That's {}%",
             max_mem_data.max_mem_snapshot.used_memory,
@@ -225,7 +274,7 @@ fn handle_max_mem_statistics(max_mem_data: MaxMemData, system: &sysinfo::System)
             )
         );
         info!("Here is the system at that time:");
-        print_processes_by_memory(&max_mem_data.max_mem_snapshot);
+        print_processes_by_memory(system, &max_mem_data.max_mem_snapshot);
         return MaxMemData {
             max_mem_snapshot: SystemState::new(Some(system)),
             have_recently_printed_max_mem_usage: true,
@@ -276,12 +325,12 @@ fn extract_pid_from_kill_line(line: &str) -> Result<i32, String> {
     }
 }
 
-fn get_snapshot_with_killed_process(
-    snapshots: &VecDeque<SystemState>,
-    killed_process_id: i32,
-) -> Option<&SystemState> {
+fn get_snapshot_with_killed_process<'a>(
+    snapshots: &'a VecDeque<SystemState>,
+    killed_process_id: &Pid,
+) -> Option<&'a SystemState> {
     for snapshot in snapshots {
-        if snapshot.processes.contains_key(&killed_process_id) {
+        if snapshot.processes.contains_key(killed_process_id) {
             return Some(snapshot);
         }
     }
@@ -325,7 +374,7 @@ fn get_dmesg_kill_lines() -> std::result::Result<Vec<String>, String> {
     }
 }
 
-fn process_to_long_string(process: &Process, snapshot: &SystemState) -> String {
+fn process_to_long_string(process: &ProcessData, snapshot: &SystemState) -> String {
     format!(
         "PID: {}
     Name: {}
@@ -339,23 +388,23 @@ fn process_to_long_string(process: &Process, snapshot: &SystemState) -> String {
     CWD: {:?}
     Root: {:?}
     Executable: {:?}",
-        process.pid(),
-        process.name(),
-        process.memory(),
-        memory_percentage(process.memory(), snapshot.total_memory),
-        process.cpu_usage(),
-        parent_to_string(process.parent()),
-        process.cmd(),
-        stringlist_to_string(process.environ()),
-        process.status(),
-        process.start_time(),
-        process.cwd(),
-        process.root(),
-        process.exe()
+        process.pid,
+        process.name,
+        process.memory,
+        memory_percentage(process.memory, snapshot.total_memory),
+        process.cpu_usage,
+        parent_to_string(process.parent.as_ref()),
+        process.cmd,
+        stringlist_to_string(&process.environ),
+        process.status,
+        process.start_time,
+        process.cwd,
+        process.root,
+        process.exe
     )
 }
 
-fn stringlist_to_string(list: &[String]) -> String {
+fn stringlist_to_string(list: &Vec<String>) -> String {
     let mut accumulator = "[".to_owned() + list.first().unwrap_or(&"".to_owned());
     for elem in list {
         accumulator = accumulator + ", " + elem;
@@ -367,27 +416,27 @@ fn memory_percentage(used: u64, total: u64) -> f32 {
     (100.0 * used as f64 / total as f64) as f32
 }
 
-fn parent_to_string(parent: Option<i32>) -> String {
+fn parent_to_string(parent: Option<&Pid>) -> String {
     match parent {
         Some(pid) => pid.to_string(),
         None => "None".to_owned(),
     }
 }
 
-fn get_user_by_uid(uid: u32) -> String {
-    match users::get_user_by_uid(uid) {
+fn get_user_by_uid(system: &System, uid: &Option<Uid>) -> String {
+    match uid.as_ref().and_then(|uid| system.get_user_by_id(uid)) {
         None => "None".to_owned(),
-        Some(user) => user.name().to_str().unwrap_or("").to_owned(),
+        Some(user) => user.name().to_string(),
     }
 }
 
-fn print_processes_by_memory(snapshot: &SystemState) {
-    let mut processes: Vec<Process> = snapshot
+fn print_processes_by_memory(system: &System, snapshot: &SystemState) {
+    let mut processes: Vec<&ProcessData> = snapshot
         .processes
         .iter()
-        .map(|(_, process)| process.clone())
+        .map(|(_, process)| process)
         .collect();
-    processes.sort_by_key(|process| process.memory());
+    processes.sort_by_key(|process| process.memory);
     info!("Processes, sorted by memory usage:");
     info!(
         "{:17} {:7} {:7} {:30} {:9}kB {:7.7}% {:7.7}% {}",
@@ -396,14 +445,14 @@ fn print_processes_by_memory(snapshot: &SystemState) {
     for process in processes {
         info!(
             "{:17} {:7} {:7} {:30.30} {:9}kB {:5.5}% {:5.5}% {:?}",
-            get_user_by_uid(process.uid),
-            process.pid(),
-            parent_to_string(process.parent()),
-            process.name(),
-            process.memory(),
-            memory_percentage(process.memory(), snapshot.total_memory),
-            process.cpu_usage(),
-            process.cmd()
+            get_user_by_uid(system, &process.user_id),
+            process.pid,
+            parent_to_string(process.parent.as_ref()),
+            process.name,
+            process.memory,
+            memory_percentage(process.memory, snapshot.total_memory),
+            process.cpu_usage,
+            process.cmd
         );
     }
 }
