@@ -46,9 +46,7 @@ impl SystemState {
                 );
                 new_state(&system)
             }
-            Some(system) => {
-                new_state(system)
-            }
+            Some(system) => new_state(system),
         }
     }
 }
@@ -186,7 +184,7 @@ fn handle_ooms(oom_data: OomData, system: &sysinfo::System) -> OomData {
                                         snapshot.processes.get(&killed_process_id);
                                     match maybe_killed_process {
                                             None => error!("get_snapshot_with_killed_process malfunctioned. Should never happen"),
-                                            Some(killed_process) => info!("The following process was killed: {}", process_to_long_string(killed_process, &snapshot))
+                                            Some(killed_process) => info!("The following process was killed: {}", process_to_long_string(killed_process, snapshot))
                                         }
                                     print_processes_by_memory(snapshot)
                                 }
@@ -262,7 +260,7 @@ fn systemstate_with_highest_mem_usage(a: SystemState, b: SystemState) -> SystemS
 fn extract_pid_from_kill_line(line: &str) -> Result<i32, String> {
     match Regex::new(r"Killed process (\d*)") {
         Err(e) => Err(format!("Could not compile regex: {}", e)),
-        Ok(re) => match re.captures(&line) {
+        Ok(re) => match re.captures(line) {
             None => Err(format!(
                 "No captures in line \"{}\" even though it was registered as a kill line.",
                 line
@@ -284,7 +282,7 @@ fn get_snapshot_with_killed_process(
 ) -> Option<&SystemState> {
     for snapshot in snapshots {
         if snapshot.processes.contains_key(&killed_process_id) {
-            return Some(&snapshot);
+            return Some(snapshot);
         }
     }
     None
@@ -355,13 +353,12 @@ fn process_to_long_string(process: &Process, snapshot: &SystemState) -> String {
         process.root(),
         process.exe()
     )
-    .to_owned()
 }
 
 fn stringlist_to_string(list: &[String]) -> String {
     let mut accumulator = "[".to_owned() + list.first().unwrap_or(&"".to_owned());
     for elem in list {
-        accumulator = accumulator + ", " + &elem;
+        accumulator = accumulator + ", " + elem;
     }
     accumulator + "]"
 }
